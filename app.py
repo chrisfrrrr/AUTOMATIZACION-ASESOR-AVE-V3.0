@@ -111,6 +111,12 @@ if generate:
         analysis_dt = datetime.combine(analysis_date, datetime.max.time()).replace(tzinfo=timezone.utc)
         progress.progress(10, text='Extrayendo estudiantes e inscripciones...')
         enrollments = client.enrollments(course_id, section_id)
+        # Diagnóstico: Canvas puede mostrar más estudiantes en Personas que los activos
+        # realmente analizables por API. Lo guardamos para explicar diferencias.
+        try:
+            diagnostic_enrollments = client.enrollments_for_diagnostic(course_id, section_id)
+        except Exception:
+            diagnostic_enrollments = enrollments
         enroll_df = normalize_enrollments(enrollments, analysis_dt, course_start, daily_hours, only_business)
         valid_ids = set(enroll_df['user_id'].dropna().astype(int).tolist()) if not enroll_df.empty else set()
         progress.progress(30, text='Extrayendo actividades publicadas...')
@@ -126,7 +132,7 @@ if generate:
         student_ids_for_submissions = sorted(valid_ids) if valid_ids else None
         submissions = client.submissions(course_id, student_ids=student_ids_for_submissions, chunk_size=10)
         sub_df = normalize_submissions(submissions)
-        module_matrix = build_module_completion_matrix(enroll_df, module_items_df, sub_df)
+        module_matrix = build_module_completion_matrix(enroll_df, module_items_df, sub_df, analysis_dt)
         if section_id and valid_ids and not sub_df.empty:
             sub_df = sub_df[sub_df['user_id'].isin(valid_ids)]
         progress.progress(72, text='Calculando índice integral de riesgo AVE...')
@@ -150,6 +156,7 @@ if generate:
             'section_id': section_id,
             'analysis_date': str(analysis_date),
             'generated_by': generated_by,
+            'diagnostic_enrollments': diagnostic_enrollments,
         }
         progress.progress(100, text='Análisis finalizado')
         st.success('Análisis Pro 2.1 generado correctamente.')
@@ -169,6 +176,7 @@ assign_df = analysis['assignments']
 modules_df = analysis.get('modules', pd.DataFrame())
 module_items_df = analysis.get('module_items', pd.DataFrame())
 module_matrix = analysis.get('module_matrix', pd.DataFrame())
+diagnostic_enrollments = analysis.get('diagnostic_enrollments', [])
 hist = load_history(course_id, section_id)
 followups = load_followups(course_id, section_id)
 analysis['history'] = hist
@@ -190,7 +198,9 @@ if not student_options:
     st.stop()
 
 risk_counts = summary['riesgo_integral'].value_counts().to_dict()
-pend_tot = int(summary.get('pendientes', pd.Series([0])).sum())
+pend_actual_tot = int(summary.get('pendientes_actuales', summary.get('pendientes', pd.Series([0]))).sum())
+pend_futuro_tot = int(summary.get('pendientes_futuros', pd.Series([0])).sum())
+pend_total_tot = int(summary.get('pendientes_total', pd.Series([0])).sum())
 atr_tot = int(summary.get('atrasadas', pd.Series([0])).sum())
 avg_adv = float(summary.get('porcentaje_avance', pd.Series([0])).mean())
 urgent = int((summary.get('segmento_ave', pd.Series([])) == 'Intervención inmediata').sum())
@@ -201,18 +211,24 @@ kpis = [
     ('Riesgo alto', risk_counts.get('Alto', 0)),
     ('Riesgo medio', risk_counts.get('Medio', 0)),
     ('Intervención hoy', urgent),
-    ('Pendientes', pend_tot),
+    ('Pendientes actuales', pend_actual_tot),
+    ('Pendientes futuros', pend_futuro_tot),
     ('Atrasadas', atr_tot),
-    ('Avance promedio', f'{avg_adv:.1f}%'),
+    ('Avance actual', f'{avg_adv:.1f}%'),
 ]
 cols = st.columns(len(kpis))
 for col, (label, value) in zip(cols, kpis):
     col.markdown(f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>', unsafe_allow_html=True)
 
+st.markdown(
+    '<div class="section-note"><b>Nota de lectura:</b> “Pendientes actuales” no representa estudiantes, sino el total acumulado de entregables no realizados entre los estudiantes analizados y que ya corresponden a la fecha de corte. “Pendientes futuros” corresponde a entregables publicados cuya fecha de entrega es posterior al corte. “Estudiantes” representa únicamente inscripciones activas analizadas por la app.</div>',
+    unsafe_allow_html=True
+)
+
 st.divider()
 
-tab_inicio, tab_riesgo, tab_est, tab_mod, tab_ent, tab_hist, tab_bit, tab_msg, tab_rep, tab_conf = st.tabs([
-    'Inicio', 'Riesgo académico', 'Estudiantes', 'Módulos', 'Entregas', 'Historial', 'Bitácora', 'Mensajes', 'Reportes', 'Configuración'
+tab_inicio, tab_riesgo, tab_est, tab_mod, tab_ent, tab_diag, tab_hist, tab_bit, tab_msg, tab_rep, tab_conf = st.tabs([
+    'Inicio', 'Riesgo académico', 'Estudiantes', 'Módulos', 'Entregas', 'Diagnóstico Canvas', 'Historial', 'Bitácora', 'Mensajes', 'Reportes', 'Configuración'
 ])
 
 with tab_inicio:
@@ -245,8 +261,8 @@ with tab_riesgo:
         risk_view = risk_view[risk_view['riesgo_integral'].isin(['Alto','Medio'])]
     if mode == 'Intervención inmediata':
         risk_view = risk_view[risk_view['segmento_ave'].eq('Intervención inmediata')]
-    risk_view = risk_view.sort_values(['puntaje_riesgo','horas_sin_actividad','pendientes','atrasadas'], ascending=[False,False,False,False])
-    cols_show = [c for c in ['estudiante','correo','riesgo_integral','segmento_ave','puntaje_riesgo','horas_sin_actividad','tiempo_total_horas','deficit_horas','pendientes','atrasadas','porcentaje_avance','accion_recomendada'] if c in risk_view.columns]
+    risk_view = risk_view.sort_values(['puntaje_riesgo','horas_sin_actividad','pendientes_actuales','atrasadas'], ascending=[False,False,False,False])
+    cols_show = [c for c in ['estudiante','correo','riesgo_integral','segmento_ave','puntaje_riesgo','horas_sin_actividad','tiempo_total_horas','deficit_horas','pendientes_actuales','pendientes_futuros','atrasadas','porcentaje_avance','accion_recomendada'] if c in risk_view.columns]
     st.dataframe(risk_view[cols_show], use_container_width=True, hide_index=True)
     st.download_button('Descargar alertas CSV', risk_view[cols_show].to_csv(index=False).encode('utf-8-sig'), file_name=f'alertas_ave_{course_id}.csv', mime='text/csv', use_container_width=True)
 
@@ -280,13 +296,13 @@ with tab_mod:
         matrix_view = module_matrix.copy()
         if selected_module_name != 'Todos los módulos' and not matrix_view.empty:
             matrix_view = matrix_view[matrix_view['modulo'].eq(selected_module_name)]
-        status_filter = st.multiselect('Filtrar estado de entregables', ['Entregado','Pendiente','Atrasado','No aplica'], default=['Entregado','Pendiente','Atrasado'])
+        status_filter = st.multiselect('Filtrar estado de entregables', ['Entregado','Pendiente actual','Pendiente futuro','Atrasado','No aplica'], default=['Entregado','Pendiente actual','Atrasado'])
         if not matrix_view.empty:
             matrix_view = matrix_view[matrix_view['estado'].isin(status_filter)]
             cols_matrix = [c for c in ['estudiante','correo','modulo','entregable','tipo_item','fecha_entrega','estado','score','submitted_at','html_url'] if c in matrix_view.columns]
             st.dataframe(matrix_view[cols_matrix], use_container_width=True, hide_index=True)
             st.download_button('Descargar matriz de módulos CSV', matrix_view[cols_matrix].to_csv(index=False).encode('utf-8-sig'), file_name=f'matriz_modulos_{course_id}.csv', mime='text/csv', use_container_width=True)
-            pendientes_mod = matrix_view[matrix_view['estado'].isin(['Pendiente','Atrasado'])]
+            pendientes_mod = matrix_view[matrix_view['estado'].isin(['Pendiente actual','Atrasado'])]
             if not pendientes_mod.empty:
                 resumen_mod = pendientes_mod.groupby(['modulo','entregable']).size().reset_index(name='estudiantes_pendientes').sort_values('estudiantes_pendientes', ascending=False)
                 st.markdown('#### Entregables con más estudiantes pendientes')
@@ -319,6 +335,55 @@ with tab_ent:
     with c2:
         st.caption('Detalle de entregas')
         st.dataframe(sub_df, use_container_width=True, hide_index=True)
+
+with tab_diag:
+    st.markdown('### Diagnóstico de datos Canvas')
+    st.caption('Esta vista explica por qué la cantidad de estudiantes vista en Canvas puede no coincidir con la cantidad analizada por la app.')
+
+    diag_rows = []
+    for e in diagnostic_enrollments or []:
+        u = e.get('user') or {}
+        diag_rows.append({
+            'user_id': u.get('id') or e.get('user_id'),
+            'nombre': u.get('sortable_name') or u.get('name'),
+            'correo': u.get('login_id') or u.get('email') or '',
+            'estado_detectado': e.get('enrollment_state') or e.get('workflow_state') or e.get('_diagnostic_state_requested') or 'sin_estado',
+            'section_id': e.get('course_section_id'),
+            'tipo': e.get('type'),
+            'ultima_actividad': e.get('last_activity_at'),
+        })
+    diag_df = pd.DataFrame(diag_rows)
+    total_canvas = int(diag_df['user_id'].nunique()) if not diag_df.empty and 'user_id' in diag_df.columns else len(summary)
+    activos_analizados = len(summary)
+    excluidos = max(0, total_canvas - activos_analizados)
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric('Estudiantes detectados en Canvas/API', total_canvas)
+    d2.metric('Estudiantes activos analizados', activos_analizados)
+    d3.metric('Excluidos del análisis', excluidos)
+    d4.metric('Sección analizada', section_name)
+
+    st.markdown("""
+**Interpretación:** Canvas puede mostrar una cantidad mayor en la vista de personas porque puede incluir estudiantes inactivos, pendientes, concluidos, de otras secciones o registros que no están activos para análisis. La app calcula riesgo únicamente con estudiantes activos tipo `StudentEnrollment` dentro del curso o sección seleccionada.
+""")
+    if not diag_df.empty:
+        st.markdown('#### Desglose de inscripciones detectadas')
+        state_count = diag_df.groupby('estado_detectado')['user_id'].nunique().reset_index(name='cantidad').sort_values('cantidad', ascending=False)
+        st.dataframe(state_count, use_container_width=True, hide_index=True)
+        with st.expander('Ver detalle de estudiantes detectados por Canvas/API'):
+            st.dataframe(diag_df, use_container_width=True, hide_index=True)
+
+    st.markdown('### Diagnóstico de entregables')
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric('Entregables publicados detectados', int(assign_df['assignment_id'].nunique()) if not assign_df.empty and 'assignment_id' in assign_df.columns else 0)
+    e2.metric('Pendientes actuales acumulados', pend_actual_tot)
+    e3.metric('Pendientes futuros acumulados', pend_futuro_tot)
+    e4.metric('Pendientes totales acumulados', pend_total_tot)
+    st.markdown("""
+**Pendientes actuales** = actividades no entregadas que ya corresponden según la fecha de corte.  
+**Pendientes futuros** = actividades no entregadas con fecha posterior al corte.  
+**Atrasadas** = pendientes actuales con fecha vencida, o que Canvas marca como `late`/`missing`.  
+**Avance actual** = entregas realizadas sobre actividades actuales, no sobre todo el curso futuro.
+""")
 
 with tab_hist:
     st.markdown('### Historial y evolución')
@@ -441,7 +506,7 @@ with tab_msg:
                 st.info('Pruebe primero con un solo profesor/TA. Si funciona, envíe a estudiantes en bloques pequeños y con conversación grupal desmarcada.')
     contact_all = summary[summary['riesgo_integral'].isin(['Alto','Medio'])].sort_values(['puntaje_riesgo','horas_sin_actividad'], ascending=[False,False])
     st.markdown('#### Listado completo para contacto')
-    contact_cols = [c for c in ['estudiante','correo','riesgo_integral','segmento_ave','puntaje_riesgo','horas_sin_actividad','pendientes','atrasadas','accion_recomendada'] if c in contact_all.columns]
+    contact_cols = [c for c in ['estudiante','correo','riesgo_integral','segmento_ave','puntaje_riesgo','horas_sin_actividad','pendientes_actuales','pendientes_futuros','atrasadas','accion_recomendada'] if c in contact_all.columns]
     st.dataframe(contact_all[contact_cols], use_container_width=True, hide_index=True)
 
 with tab_rep:

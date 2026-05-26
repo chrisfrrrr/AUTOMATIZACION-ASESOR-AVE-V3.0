@@ -134,6 +134,33 @@ class CanvasClient:
             'include[]': ['user', 'avatar_url']
         })
 
+    def enrollments_for_diagnostic(self, course_id: int | str, section_id: Optional[int | str] = None) -> List[Dict[str, Any]]:
+        """Intenta recuperar estudiantes en varios estados para explicar diferencias con Canvas.
+
+        La vista Personas/Módulos de Canvas puede mostrar estudiantes activos, pendientes,
+        inactivos o concluidos. El análisis operativo solo usa activos; esta función
+        sirve para mostrar cuántos quedaron fuera y por qué, sin afectar el cálculo.
+        """
+        endpoint = f'sections/{section_id}/enrollments' if section_id else f'courses/{course_id}/enrollments'
+        states = ['active', 'invited', 'creation_pending', 'completed', 'inactive']
+        found: Dict[int, Dict[str, Any]] = {}
+        for state in states:
+            try:
+                rows = self.get(endpoint, params={
+                    'type[]': 'StudentEnrollment',
+                    'state[]': state,
+                    'include[]': ['user']
+                })
+                for e in rows or []:
+                    u = e.get('user') or {}
+                    uid = u.get('id') or e.get('user_id')
+                    if uid is not None:
+                        e['_diagnostic_state_requested'] = state
+                        found[int(uid)] = e
+            except Exception:
+                continue
+        return list(found.values())
+
 
     def teachers(self, course_id: int | str) -> List[Dict[str, Any]]:
         return self.get(f'courses/{course_id}/enrollments', params={

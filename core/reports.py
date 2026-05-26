@@ -117,7 +117,9 @@ def excel_bytes(summary: pd.DataFrame, submissions: pd.DataFrame, history: pd.Da
             ['Riesgo bajo', counts.get('Bajo',0)],
             ['Avance promedio', round(float(summary.get('porcentaje_avance', pd.Series([0])).mean()),2)],
             ['Horas promedio', round(float(summary.get('tiempo_total_horas', pd.Series([0])).mean()),2)],
-            ['Pendientes totales', int(summary.get('pendientes', pd.Series([0])).sum())],
+            ['Pendientes actuales', int(summary.get('pendientes_actuales', summary.get('pendientes', pd.Series([0]))).sum())],
+            ['Pendientes futuros', int(summary.get('pendientes_futuros', pd.Series([0])).sum())],
+            ['Pendientes totales', int(summary.get('pendientes_total', pd.Series([0])).sum())],
             ['Atrasadas totales', int(summary.get('atrasadas', pd.Series([0])).sum())],
         ]
         for r in kpis: ws_kpi.append(r)
@@ -168,16 +170,16 @@ def pdf_bytes(summary: pd.DataFrame, course_name: str, section_name: str, genera
     _header(story, styles, 'Informe Ejecutivo de Seguimiento Académico AVE', course_name, section_name, generated_by, analysis_date, logo_ave, logo_uvg)
     total = len(summary) if summary is not None else 0
     counts = summary['riesgo_integral'].value_counts().to_dict() if total and 'riesgo_integral' in summary.columns else {}
-    kpi = [['Total estudiantes','Riesgo bajo','Riesgo medio','Riesgo alto','Prom. avance','Pendientes','Atrasadas'],[total, counts.get('Bajo',0), counts.get('Medio',0), counts.get('Alto',0), f"{summary['porcentaje_avance'].mean():.1f}%" if total and 'porcentaje_avance' in summary else '0%', int(summary.get('pendientes', pd.Series([0])).sum()) if total else 0, int(summary.get('atrasadas', pd.Series([0])).sum()) if total else 0]]
-    kt = Table(kpi, colWidths=[1.25*inch]*7)
+    kpi = [['Total estudiantes','Riesgo bajo','Riesgo medio','Riesgo alto','Prom. avance','Pendientes actuales','Pendientes futuros','Atrasadas'],[total, counts.get('Bajo',0), counts.get('Medio',0), counts.get('Alto',0), f"{summary['porcentaje_avance'].mean():.1f}%" if total and 'porcentaje_avance' in summary else '0%', int(summary.get('pendientes_actuales', summary.get('pendientes', pd.Series([0]))).sum()) if total else 0, int(summary.get('pendientes_futuros', pd.Series([0])).sum()) if total else 0, int(summary.get('atrasadas', pd.Series([0])).sum()) if total else 0]]
+    kt = Table(kpi, colWidths=[1.15*inch]*8)
     kt.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#172B85')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.25,colors.grey),('ALIGN',(0,0),(-1,-1),'CENTER'),('FONTSIZE',(0,0),(-1,-1),8)]))
     story += [kt, Spacer(1, 10)]
-    story.append(Paragraph('<b>Interpretación ejecutiva:</b> el riesgo integral prioriza desconexión, déficit de horas, entregas pendientes, entregas atrasadas, bajo avance y reincidencia operativa. El listado siguiente incluye todos los casos de riesgo Alto y Medio para intervención del asesor.', styles['SmallAVE']))
+    story.append(Paragraph('<b>Interpretación ejecutiva:</b> el riesgo integral prioriza desconexión, déficit de horas, entregas pendientes actuales, pendientes futuros, entregas atrasadas, bajo avance y reincidencia operativa. El listado siguiente incluye todos los casos de riesgo Alto y Medio para intervención del asesor.', styles['SmallAVE']))
     story.append(Spacer(1, 8))
     if summary is None or summary.empty:
         story.append(Paragraph('No hay estudiantes para mostrar.', styles['SmallAVE']))
     else:
-        cols = ['estudiante','correo','horas_sin_actividad','riesgo_desconexion','pendientes','atrasadas','porcentaje_avance','puntaje_riesgo','riesgo_integral','segmento_ave','accion_recomendada']
+        cols = ['estudiante','correo','horas_sin_actividad','riesgo_desconexion','pendientes_actuales','pendientes_futuros','atrasadas','porcentaje_avance','puntaje_riesgo','riesgo_integral','segmento_ave','accion_recomendada']
         view = summary.copy()
         for c in cols:
             if c not in view.columns: view[c] = ''
@@ -187,8 +189,8 @@ def pdf_bytes(summary: pd.DataFrame, course_name: str, section_name: str, genera
         if view.empty:
             view = summary.sort_values(['puntaje_riesgo','horas_sin_actividad'], ascending=[False,False])
         story.append(Paragraph(f'<b>Casos listados:</b> {len(view)} estudiantes. Riesgo alto: {counts.get("Alto",0)}. Riesgo medio: {counts.get("Medio",0)}.', styles['SmallAVE']))
-        data = [['Estudiante','Correo','Hrs sin act.','Riesgo conexión','Pend.','Atr.','Avance %','Puntaje','Riesgo','Segmento','Acción']] + view[cols].fillna('').astype(str).values.tolist()
-        table = Table(data, repeatRows=1, colWidths=[1.4*inch,1.45*inch,0.62*inch,0.85*inch,0.4*inch,0.4*inch,0.55*inch,0.52*inch,0.55*inch,1.0*inch,1.35*inch])
+        data = [['Estudiante','Correo','Hrs sin act.','Riesgo conexión','Pend. actuales','Pend. futuros','Atr.','Avance actual %','Puntaje','Riesgo','Segmento','Acción']] + view[cols].fillna('').astype(str).values.tolist()
+        table = Table(data, repeatRows=1, colWidths=[1.28*inch,1.25*inch,0.58*inch,0.72*inch,0.48*inch,0.48*inch,0.42*inch,0.50*inch,0.48*inch,0.52*inch,1.0*inch,1.05*inch])
         table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#6c757d')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.22,colors.lightgrey),('FONTSIZE',(0,0),(-1,-1),6),('VALIGN',(0,0),(-1,-1),'TOP'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, colors.HexColor('#F7F9FB')])]))
         story.append(table)
     story.append(Spacer(1, 8))
@@ -205,8 +207,8 @@ def individual_pdf_bytes(student_row: dict, submissions: pd.DataFrame, followups
     name = student_row.get('estudiante') or student_row.get('nombre') or 'Estudiante'
     story.append(Paragraph(f'<b>Estudiante:</b> {name}<br/><b>Correo:</b> {student_row.get("correo", "")}<br/><b>Riesgo integral:</b> {student_row.get("riesgo_integral", "")}<br/><b>Segmento AVE:</b> {student_row.get("segmento_ave", "")}<br/><b>Acción recomendada:</b> {student_row.get("accion_recomendada", "")}', styles['SmallAVE']))
     story.append(Spacer(1, 10))
-    kpi = [['Horas sin actividad','Horas acumuladas','Horas esperadas','Déficit','Pendientes','Atrasadas','Avance %','Puntaje'],[student_row.get('horas_sin_actividad',''), student_row.get('tiempo_total_horas',''), student_row.get('horas_esperadas',''), student_row.get('deficit_horas',''), student_row.get('pendientes',''), student_row.get('atrasadas',''), student_row.get('porcentaje_avance',''), student_row.get('puntaje_riesgo','')]]
-    kt = Table(kpi, colWidths=[0.9*inch]*8)
+    kpi = [['Horas sin actividad','Horas acumuladas','Horas esperadas','Déficit','Pendientes actuales','Pendientes futuros','Atrasadas','Avance %','Puntaje'],[student_row.get('horas_sin_actividad',''), student_row.get('tiempo_total_horas',''), student_row.get('horas_esperadas',''), student_row.get('deficit_horas',''), student_row.get('pendientes_actuales', student_row.get('pendientes','')), student_row.get('pendientes_futuros',''), student_row.get('atrasadas',''), student_row.get('porcentaje_avance',''), student_row.get('puntaje_riesgo','')]]
+    kt = Table(kpi, colWidths=[0.78*inch]*9)
     kt.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#172B85')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.25,colors.grey),('FONTSIZE',(0,0),(-1,-1),7),('ALIGN',(0,0),(-1,-1),'CENTER')]))
     story += [kt, Spacer(1, 12)]
     story.append(Paragraph('Entregas del estudiante', styles['SectionAVE']))

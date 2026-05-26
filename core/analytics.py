@@ -139,31 +139,69 @@ def normalize_submissions(submissions: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def build_student_summary(enroll_df: pd.DataFrame, sub_df: pd.DataFrame, analysis_dt: datetime) -> pd.DataFrame:
+    """Construye resumen por estudiante separando pendientes actuales y futuros.
+
+    - pendientes_actuales: entregables no realizados que ya corresponden a la fecha de corte
+      o que no tienen fecha de entrega configurada.
+    - pendientes_futuros: entregables publicados con fecha posterior al corte.
+    - pendientes: se conserva como alias de pendientes_actuales para compatibilidad con reportes.
+    """
     if enroll_df.empty:
         return enroll_df
     if sub_df.empty:
         base = enroll_df.copy()
-        for col in ['actividades_total','entregadas','pendientes','atrasadas','porcentaje_avance','promedio_score']:
+        for col in ['actividades_total','actividades_actuales','entregadas','entregadas_actuales',
+                    'pendientes','pendientes_actuales','pendientes_futuros','atrasadas',
+                    'porcentaje_avance','porcentaje_avance_curso','promedio_score']:
             base[col] = 0
         return score_risk(base)
+
     sub = sub_df.copy()
+    if 'fecha_entrega' not in sub.columns:
+        sub['fecha_entrega'] = pd.NaT
+    if 'excused' not in sub.columns:
+        sub['excused'] = False
+    if 'workflow_state' not in sub.columns:
+        sub['workflow_state'] = ''
+
     submitted = sub['submitted_at'].notna() | sub['workflow_state'].isin(['submitted', 'graded'])
-    sub['entregada_calc'] = submitted & ~sub['excused']
-    due_past = sub['fecha_entrega'].notna() & (sub['fecha_entrega'] < analysis_dt)
-    sub['pendiente_calc'] = ~sub['entregada_calc'] & ~sub['excused']
-    sub['atrasada_calc'] = sub['pendiente_calc'] & (sub['late'] | sub['missing'] | due_past)
+    sub['entregada_calc'] = submitted & ~sub['excused'].fillna(False)
+
+    due = sub['fecha_entrega']
+    sub['es_futura_calc'] = due.notna() & (due > analysis_dt)
+    # Si no tiene fecha de entrega, se considera actual para que no desaparezca del seguimiento.
+    sub['es_actual_calc'] = (~sub['es_futura_calc'])
+    due_past = due.notna() & (due < analysis_dt)
+
+    sub['pendiente_total_calc'] = ~sub['entregada_calc'] & ~sub['excused'].fillna(False)
+    sub['pendiente_actual_calc'] = sub['pendiente_total_calc'] & sub['es_actual_calc']
+    sub['pendiente_futuro_calc'] = sub['pendiente_total_calc'] & sub['es_futura_calc']
+    sub['atrasada_calc'] = sub['pendiente_actual_calc'] & (sub.get('late', False).fillna(False) | sub.get('missing', False).fillna(False) | due_past)
+
     grp = sub.groupby('user_id').agg(
         actividades_total=('assignment_id', 'nunique'),
+        actividades_actuales=('es_actual_calc', 'sum'),
         entregadas=('entregada_calc', 'sum'),
-        pendientes=('pendiente_calc', 'sum'),
+        entregadas_actuales=('entregada_calc', lambda x: int(((x) & sub.loc[x.index, 'es_actual_calc']).sum())),
+        pendientes_total=('pendiente_total_calc', 'sum'),
+        pendientes_actuales=('pendiente_actual_calc', 'sum'),
+        pendientes_futuros=('pendiente_futuro_calc', 'sum'),
         atrasadas=('atrasada_calc', 'sum'),
         promedio_score=('score', 'mean')
     ).reset_index()
-    grp['porcentaje_avance'] = np.where(grp['actividades_total'] > 0, (grp['entregadas'] / grp['actividades_total'] * 100).round(1), 0)
+    grp['pendientes'] = grp['pendientes_actuales']
+    grp['porcentaje_avance'] = np.where(grp['actividades_actuales'] > 0, (grp['entregadas_actuales'] / grp['actividades_actuales'] * 100).round(1), 0)
+    grp['porcentaje_avance_curso'] = np.where(grp['actividades_total'] > 0, (grp['entregadas'] / grp['actividades_total'] * 100).round(1), 0)
+
     base = enroll_df.merge(grp, on='user_id', how='left')
-    fill_cols = ['actividades_total','entregadas','pendientes','atrasadas','porcentaje_avance']
+    fill_cols = ['actividades_total','actividades_actuales','entregadas','entregadas_actuales',
+                 'pendientes_total','pendientes','pendientes_actuales','pendientes_futuros',
+                 'atrasadas','porcentaje_avance','porcentaje_avance_curso']
+    for col in fill_cols:
+        if col not in base.columns:
+            base[col] = 0
     base[fill_cols] = base[fill_cols].fillna(0)
-    base['promedio_score'] = base['promedio_score'].fillna(0).round(2)
+    base['promedio_score'] = base.get('promedio_score', pd.Series([0]*len(base))).fillna(0).round(2)
     return score_risk(base)
 
 def score_risk(df: pd.DataFrame) -> pd.DataFrame:
@@ -263,12 +301,11 @@ def normalize_module_items(modules: list[dict]) -> pd.DataFrame:
         df = df.sort_values(['posicion_modulo','posicion_item'])
     return df
 
-def build_module_completion_matrix(enroll_df: pd.DataFrame, module_items_df: pd.DataFrame, sub_df: pd.DataFrame) -> pd.DataFrame:
+def build_module_completion_matrix(enroll_df: pd.DataFrame, module_items_df: pd.DataFrame, sub_df: pd.DataFrame, analysis_dt: datetime | None = None) -> pd.DataFrame:
     """Cruza estudiantes vs entregables de módulos.
 
-    Usa `content_id` de los ítems tipo Assignment/Quiz/Discussion para empatar con
-    `assignment_id` de submissions. Para recursos no calificables, conserva el ítem
-    como referencia, pero su estado queda como "No aplica" si no hay submission.
+    Clasifica cada entregable como Entregado, Pendiente actual, Pendiente futuro,
+    Atrasado o No aplica, usando la fecha de corte cuando está disponible.
     """
     if enroll_df.empty or module_items_df.empty:
         return pd.DataFrame()
@@ -285,19 +322,50 @@ def build_module_completion_matrix(enroll_df: pd.DataFrame, module_items_df: pd.
             matched = pd.DataFrame()
             if not stu_sub.empty and pd.notna(content_id):
                 matched = stu_sub[stu_sub['assignment_id'].eq(content_id)]
+            fecha_entrega = item.get('fecha_entrega')
+            es_futuro = False
+            if analysis_dt is not None and pd.notna(fecha_entrega):
+                try:
+                    es_futuro = fecha_entrega > analysis_dt
+                except Exception:
+                    es_futuro = False
             if not matched.empty:
                 s = matched.iloc[0]
                 entregada = bool(pd.notna(s.get('submitted_at')) or s.get('workflow_state') in ['submitted','graded'])
                 pendiente = not entregada and not bool(s.get('excused'))
                 atrasada = bool(s.get('late')) or bool(s.get('missing'))
-                estado = 'Entregado' if entregada else ('Atrasado' if atrasada else 'Pendiente')
+                if pendiente and analysis_dt is not None and pd.notna(fecha_entrega):
+                    try:
+                        atrasada = atrasada or (fecha_entrega < analysis_dt)
+                    except Exception:
+                        pass
+                if entregada:
+                    estado = 'Entregado'
+                elif atrasada:
+                    estado = 'Atrasado'
+                elif es_futuro:
+                    estado = 'Pendiente futuro'
+                else:
+                    estado = 'Pendiente actual'
                 score = s.get('score')
                 submitted_at = s.get('submitted_at')
             else:
                 entregada = False
                 pendiente = True if item.get('es_entregable') else False
                 atrasada = False
-                estado = 'Pendiente' if item.get('es_entregable') else 'No aplica'
+                if not item.get('es_entregable'):
+                    estado = 'No aplica'
+                elif es_futuro:
+                    estado = 'Pendiente futuro'
+                else:
+                    estado = 'Pendiente actual'
+                    if analysis_dt is not None and pd.notna(fecha_entrega):
+                        try:
+                            if fecha_entrega < analysis_dt:
+                                estado = 'Atrasado'
+                                atrasada = True
+                        except Exception:
+                            pass
                 score = None
                 submitted_at = None
             rows.append({
@@ -310,10 +378,12 @@ def build_module_completion_matrix(enroll_df: pd.DataFrame, module_items_df: pd.
                 'entregable': item.get('titulo_item'),
                 'tipo_item': item.get('tipo_item'),
                 'content_id': content_id,
-                'fecha_entrega': item.get('fecha_entrega'),
+                'fecha_entrega': fecha_entrega,
                 'estado': estado,
                 'entregado': entregada,
                 'pendiente': pendiente,
+                'pendiente_actual': estado in ['Pendiente actual','Atrasado'],
+                'pendiente_futuro': estado == 'Pendiente futuro',
                 'atrasado': atrasada,
                 'score': score,
                 'submitted_at': submitted_at,
