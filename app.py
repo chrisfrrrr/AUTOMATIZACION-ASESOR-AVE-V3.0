@@ -13,7 +13,7 @@ from core.reports import excel_bytes, pdf_bytes, individual_pdf_bytes, DEV
 from core.storage import save_snapshot, load_history, save_followup, load_followups, delete_followup
 
 load_dotenv()
-st.set_page_config(page_title='AVE Canvas Analytics Pro 2.0', page_icon='assets/app_icon.ico', layout='wide')
+st.set_page_config(page_title='AVE Canvas Analytics Pro 2.1', page_icon='assets/app_icon.ico', layout='wide')
 
 LOGO_AVE = 'assets/logo_ave.png'
 LOGO_UVG = 'assets/logo_uvg.png'
@@ -41,7 +41,7 @@ with st.sidebar:
     if Path(LOGO_AVE).exists(): cols[0].image(LOGO_AVE, use_container_width=True)
     if Path(LOGO_UVG).exists(): cols[1].image(LOGO_UVG, use_container_width=True)
     st.markdown('### Configuración Canvas')
-    st.caption('AVE Canvas Analytics Pro 2.0')
+    st.caption('AVE Canvas Analytics Pro 2.1')
     canvas_url = st.text_input('URL Canvas', value=os.getenv('CANVAS_URL', 'https://uvg.instructure.com'))
     token = st.text_input('Token de acceso', value=os.getenv('CANVAS_TOKEN', ''), type='password')
     generated_by = st.text_input('Nombre de quien genera el informe', value='')
@@ -65,7 +65,7 @@ with st.sidebar:
             st.error(f'No se pudo conectar: {e}')
     st.caption(f'Desarrollador: {DEV}')
 
-st.markdown('<p class="ave-title">Herramienta profesional de seguimiento académico AVE</p>', unsafe_allow_html=True)
+st.markdown('<p class="ave-title">Herramienta profesional de seguimiento académico AVE Pro 2.1</p>', unsafe_allow_html=True)
 st.markdown('<p class="ave-subtitle">Dashboard ejecutivo, riesgo integral, bitácora de intervención, reportes y automatización desde Canvas.</p>', unsafe_allow_html=True)
 
 if not st.session_state.client:
@@ -98,7 +98,7 @@ section_name = section.get('name') if section else 'Todas las secciones'
 
 colA, colB, colC = st.columns([1.15,1,2.5])
 with colA:
-    generate = st.button('Generar análisis Pro 2.0', type='primary', use_container_width=True)
+    generate = st.button('Generar análisis Pro 2.1', type='primary', use_container_width=True)
 with colB:
     clear = st.button('Limpiar resultados', use_container_width=True)
 if clear:
@@ -152,7 +152,7 @@ if generate:
             'generated_by': generated_by,
         }
         progress.progress(100, text='Análisis finalizado')
-        st.success('Análisis Pro 2.0 generado correctamente.')
+        st.success('Análisis Pro 2.1 generado correctamente.')
     except CanvasAPIError as e:
         st.error(f'Canvas devolvió un error: {e}')
     except Exception as e:
@@ -176,6 +176,17 @@ analysis['followups'] = followups
 
 if summary.empty:
     st.warning('No hay estudiantes para analizar.')
+    st.stop()
+
+# Opciones globales de estudiantes para todas las pestañas.
+# Antes solo se creaban dentro de la pestaña Bitácora, por eso la pestaña
+# Módulos podía fallar con NameError cuando intentaba usarlas primero.
+student_options = {
+    f"{r.get('estudiante', 'Sin nombre')} | {r.get('correo', '')} | ID {r.get('user_id', '')}": r
+    for _, r in summary.iterrows()
+}
+if not student_options:
+    st.warning('No se pudieron construir las opciones de estudiantes para las vistas individuales.')
     st.stop()
 
 risk_counts = summary['riesgo_integral'].value_counts().to_dict()
@@ -284,15 +295,20 @@ with tab_mod:
             st.info('No hay matriz disponible. Genere el análisis completo después de actualizar la versión.')
 
         st.markdown('#### Progreso individual por módulos')
-        student_key_mod = st.selectbox('Seleccione estudiante para revisar pendientes por módulo', list(student_options.keys()), key='mod_student')
-        selected_uid = student_options[student_key_mod]['user_id']
-        stu_matrix = module_matrix[module_matrix['user_id'].eq(selected_uid)] if not module_matrix.empty else pd.DataFrame()
-        if not stu_matrix.empty:
-            pivot = stu_matrix.groupby(['modulo','estado']).size().reset_index(name='cantidad')
-            fig = px.bar(pivot, x='modulo', y='cantidad', color='estado', title='Estado de entregables por módulo del estudiante')
-            fig.update_layout(xaxis_tickangle=-35)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(stu_matrix[[c for c in ['modulo','entregable','estado','score','fecha_entrega','submitted_at'] if c in stu_matrix.columns]], use_container_width=True, hide_index=True)
+        if student_options:
+            student_key_mod = st.selectbox('Seleccione estudiante para revisar pendientes por módulo', list(student_options.keys()), key='mod_student')
+            selected_uid = student_options[student_key_mod].get('user_id')
+            stu_matrix = module_matrix[module_matrix['user_id'].eq(selected_uid)] if not module_matrix.empty and 'user_id' in module_matrix.columns else pd.DataFrame()
+            if not stu_matrix.empty:
+                pivot = stu_matrix.groupby(['modulo','estado']).size().reset_index(name='cantidad')
+                fig = px.bar(pivot, x='modulo', y='cantidad', color='estado', title='Estado de entregables por módulo del estudiante')
+                fig.update_layout(xaxis_tickangle=-35)
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(stu_matrix[[c for c in ['modulo','entregable','estado','score','fecha_entrega','submitted_at'] if c in stu_matrix.columns]], use_container_width=True, hide_index=True)
+            else:
+                st.info('No hay registros de entregables por módulo para el estudiante seleccionado.')
+        else:
+            st.warning('No hay estudiantes disponibles para esta vista.')
 
 with tab_ent:
     st.markdown('### Actividades y entregas')
@@ -320,7 +336,6 @@ with tab_hist:
 with tab_bit:
     st.markdown('### Bitácora de intervención del asesor')
     st.caption('Registra contactos, resultados y próximas acciones por estudiante. Esta información queda almacenada localmente en SQLite y se incluye en el Excel Pro.')
-    student_options = {f"{r['estudiante']} | {r.get('correo','')} | ID {r['user_id']}": r for _, r in summary.iterrows()}
     selected_student = st.selectbox('Estudiante', list(student_options.keys()))
     stu = student_options[selected_student]
     with st.form('followup_form', clear_on_submit=True):
