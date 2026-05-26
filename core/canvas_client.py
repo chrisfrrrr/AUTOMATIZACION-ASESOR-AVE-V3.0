@@ -1,202 +1,163 @@
-from __future__ import annotations
+import time
 import requests
 from urllib.parse import urljoin
-from typing import Any, Dict, List, Optional, Iterable
-import time
 
-class CanvasAPIError(Exception):
+class CanvasError(Exception):
     pass
 
 class CanvasClient:
-    def __init__(self, base_url: str, token: str, timeout: int = 120, max_retries: int = 3):
-        self.base_url = base_url.rstrip('/') + '/'
-        # Canvas puede tardar bastante cuando se consultan entregas masivas.
-        # Usamos timeout separado: conexión corta y lectura amplia.
-        self.timeout = (10, timeout)
-        self.max_retries = max_retries
+    def __init__(self, base_url: str, token: str, timeout: int = 90, retries: int = 3):
+        self.base_url = base_url.rstrip('/')
+        self.api = self.base_url + '/api/v1'
+        self.timeout = timeout
+        self.retries = retries
         self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {token.strip()}',
-            'Accept': 'application/json'
-        })
+        self.session.headers.update({'Authorization': f'Bearer {token.strip()}'})
 
-    def _url(self, endpoint: str) -> str:
-        endpoint = endpoint.lstrip('/')
-        if endpoint.startswith('api/v1/'):
-            return urljoin(self.base_url, endpoint)
-        return urljoin(self.base_url, 'api/v1/' + endpoint)
+    def _request(self, method, path, **kwargs):
+        url = path if str(path).startswith('http') else self.api + '/' + str(path).lstrip('/')
+        last = None
+        for attempt in range(self.retries):
+            try:
+                r = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last = r
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                if not r.ok:
+                    raise CanvasError(f"Canvas respondió {r.status_code}: {r.text[:800]}")
+                return r
+            except requests.Timeout as e:
+                last = e
+                time.sleep(1.5 * (attempt + 1))
+            except requests.RequestException as e:
+                last = e
+                time.sleep(1.5 * (attempt + 1))
+        if isinstance(last, requests.Response):
+            raise CanvasError(f"Canvas respondió {last.status_code}: {last.text[:800]}")
+        raise CanvasError(f"No se pudo conectar con Canvas: {last}")
 
-    def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, paginate: bool = True) -> Any:
-        url = self._url(endpoint)
+    def get_json(self, path, params=None):
+        return self._request('GET', path, params=params).json()
+
+    def post_json(self, path, data=None, json=None):
+        return self._request('POST', path, data=data, json=json).json()
+
+    def get_paginated(self, path, params=None):
         params = dict(params or {})
         params.setdefault('per_page', 100)
-        if not paginate:
-            r = self._request_with_retry(url, params=params)
-            return self._handle(r)
-        results: List[Any] = []
-        first = True
-        while url:
-            r = self._request_with_retry(url, params=params if first else None)
-            data = self._handle(r)
-            if isinstance(data, list):
-                results.extend(data)
+        r = self._request('GET', path, params=params)
+        out = []
+        while True:
+            payload = r.json()
+            if isinstance(payload, list):
+                out.extend(payload)
             else:
-                return data
-            url = r.links.get('next', {}).get('url')
-            first = False
-        return results
+                out.append(payload)
+            nxt = r.links.get('next', {}).get('url')
+            if not nxt:
+                break
+            r = self._request('GET', nxt)
+        return out
 
+    def test(self):
+        return self.get_json('users/self')
 
-    def _request_with_retry(self, url: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        """Ejecuta GET con reintentos para evitar fallos temporales de Canvas.
+    def courses(self):
+        params = {'enrollment_state': 'active', 'include[]': ['term'], 'state[]': ['available']}
+        return self.get_paginated('courses', params=params)
 
-        Canvas puede responder lento en cursos grandes, especialmente al extraer
-        entregas. Un timeout aislado no debe romper todo el análisis si el
-        siguiente intento responde correctamente.
-        """
-        last_error = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                return self.session.get(url, params=params, timeout=self.timeout)
-            except requests.exceptions.ReadTimeout as exc:
-                last_error = exc
-                time.sleep(min(2 * attempt, 6))
-            except requests.exceptions.ConnectionError as exc:
-                last_error = exc
-                time.sleep(min(2 * attempt, 6))
-        raise CanvasAPIError(
-            'Canvas tardó demasiado en responder. Intente nuevamente o seleccione una sección específica. '
-            f'Detalle técnico: {last_error}'
-        )
+    def sections(self, course_id):
+        return self.get_paginated(f'courses/{course_id}/sections', params={'include[]': ['students']})
 
+    def enrollments(self, course_id, section_id=None, types=None):
+        if types is None:
+            types = ['StudentEnrollment']
+        params = {'type[]': types, 'state[]': ['active', 'invited', 'creation_pending'], 'include[]': ['user']}
+        if section_id:
+            path = f'sections/{section_id}/enrollments'
+        else:
+            path = f'courses/{course_id}/enrollments'
+        return self.get_paginated(path, params=params)
 
-    def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Any:
-        url = self._url(endpoint)
-        last_error = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                r = self.session.post(url, data=data or {}, timeout=self.timeout)
-                return self._handle(r)
-            except requests.exceptions.ReadTimeout as exc:
-                last_error = exc
-                time.sleep(min(2 * attempt, 6))
-            except requests.exceptions.ConnectionError as exc:
-                last_error = exc
-                time.sleep(min(2 * attempt, 6))
-        raise CanvasAPIError(f'Canvas no respondió al enviar la solicitud POST. Detalle técnico: {last_error}')
+    def students(self, course_id, section_id=None):
+        return self.enrollments(course_id, section_id, ['StudentEnrollment'])
 
-    @staticmethod
-    def _chunks(values: Iterable[Any], size: int) -> Iterable[List[Any]]:
-        chunk = []
-        for value in values:
-            if value is None:
-                continue
-            chunk.append(value)
-            if len(chunk) >= size:
-                yield chunk
-                chunk = []
-        if chunk:
-            yield chunk
+    def staff(self, course_id):
+        return self.enrollments(course_id, None, ['TeacherEnrollment', 'TaEnrollment', 'DesignerEnrollment'])
 
-    @staticmethod
-    def _handle(response: requests.Response) -> Any:
-        if response.status_code >= 400:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-            raise CanvasAPIError(f'Canvas respondió {response.status_code}: {detail}')
-        if not response.text:
+    def assignments(self, course_id):
+        return self.get_paginated(f'courses/{course_id}/assignments', params={'include[]': ['submission']})
+
+    def submissions_for_students(self, course_id, student_ids, chunk_size=25):
+        all_rows = []
+        ids = [str(x) for x in student_ids if str(x) not in ('None', '', 'nan')]
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i+chunk_size]
+            params = {
+                'student_ids[]': chunk,
+                'include[]': ['submission_history', 'assignment', 'user'],
+                'grouped': 'true'
+            }
+            data = self.get_paginated(f'courses/{course_id}/students/submissions', params=params)
+            for item in data:
+                # grouped endpoint may return [{'user_id':..., 'submissions':[...]}]
+                if isinstance(item, dict) and isinstance(item.get('submissions'), list):
+                    uid = item.get('user_id')
+                    for sub in item.get('submissions', []):
+                        if isinstance(sub, dict):
+                            sub['_group_user_id'] = uid
+                            all_rows.append(sub)
+                elif isinstance(item, dict):
+                    all_rows.append(item)
+        return all_rows
+
+    def modules_with_items(self, course_id):
+        return self.get_paginated(f'courses/{course_id}/modules', params={'include[]': ['items']})
+
+    def module_progress(self, course_id, module_id, student_id):
+        try:
+            return self.get_json(f'courses/{course_id}/modules/{module_id}', params={'include[]': ['items'], 'student_id': student_id})
+        except Exception:
             return None
-        return response.json()
 
-    def whoami(self) -> Dict[str, Any]:
-        return self.get('users/self', paginate=False)
+    def send_conversation(self, course_id, recipient_ids, subject, body, group=False, chunk_size=25):
+        """Envía mensajes por Canvas Inbox. Para privacidad, group=False envía conversaciones individuales/privadas."""
+        clean = []
+        for r in recipient_ids:
+            s = str(r).strip()
+            if s and s.lower() not in ('none', 'nan') and s not in clean:
+                clean.append(s)
+        if not clean:
+            raise CanvasError('No hay destinatarios válidos para enviar.')
 
-    def courses(self) -> List[Dict[str, Any]]:
-        return self.get('courses', params={'enrollment_state': 'active', 'include[]': ['term']})
-
-    def sections(self, course_id: int | str) -> List[Dict[str, Any]]:
-        return self.get(f'courses/{course_id}/sections')
-
-    def enrollments(self, course_id: int | str, section_id: Optional[int | str] = None) -> List[Dict[str, Any]]:
-        endpoint = f'sections/{section_id}/enrollments' if section_id else f'courses/{course_id}/enrollments'
-        return self.get(endpoint, params={
-            'type[]': 'StudentEnrollment',
-            'state[]': 'active',
-            'include[]': ['user', 'avatar_url']
-        })
-
-
-    def teachers(self, course_id: int | str) -> List[Dict[str, Any]]:
-        return self.get(f'courses/{course_id}/enrollments', params={
-            'type[]': ['TeacherEnrollment','TaEnrollment'],
-            'state[]': 'active',
-            'include[]': ['user']
-        })
-
-    def modules(self, course_id: int | str, student_id: Optional[int | str] = None) -> List[Dict[str, Any]]:
-        params = {'include[]': ['items', 'content_details']}
-        if student_id:
-            params['student_id'] = student_id
-        modules = self.get(f'courses/{course_id}/modules', params=params)
-        # Canvas puede omitir items cuando hay muchos; si pasa, los pedimos por módulo.
-        for m in modules or []:
-            if 'items' not in m or m.get('items') is None:
-                m['items'] = self.module_items(course_id, m.get('id'), student_id=student_id)
-        return modules
-
-    def module_items(self, course_id: int | str, module_id: int | str, student_id: Optional[int | str] = None) -> List[Dict[str, Any]]:
-        params = {'include[]': ['content_details']}
-        if student_id:
-            params['student_id'] = student_id
-        return self.get(f'courses/{course_id}/modules/{module_id}/items', params=params)
-
-    def send_conversation(self, recipient_ids: List[int], subject: str, body: str, course_id: Optional[int | str] = None, group_conversation: bool = False, mode: str = 'async') -> Any:
-        data = {
-            'subject': subject,
-            'body': body,
-            'group_conversation': str(bool(group_conversation)).lower(),
-            'mode': mode,
-        }
-        if course_id:
-            data['context_code'] = f'course_{course_id}'
-        for i, rid in enumerate(recipient_ids):
-            data[f'recipients[{i}]'] = str(int(rid))
-        return self.post('conversations', data=data)
-
-    def assignments(self, course_id: int | str) -> List[Dict[str, Any]]:
-        return self.get(f'courses/{course_id}/assignments', params={
-            'include[]': ['due_dates', 'all_dates'],
-            'order_by': 'due_at'
-        })
-
-    def submissions(self, course_id: int | str, student_ids: Optional[List[int]] = None, chunk_size: int = 10) -> List[Dict[str, Any]]:
-        """Devuelve entregas de estudiantes.
-
-        En cursos grandes, pedir `student_ids[]=all` puede provocar ReadTimeout
-        en Streamlit Cloud. Por eso, cuando tenemos la lista de estudiantes de
-        la sección, consultamos en bloques pequeños. Esto hace más solicitudes,
-        pero cada una pesa menos y es mucho más estable.
-        """
-        endpoint = f'courses/{course_id}/students/submissions'
-
-        if student_ids:
-            all_results: List[Dict[str, Any]] = []
-            clean_ids = [int(x) for x in student_ids if str(x).isdigit()]
-            for chunk in self._chunks(clean_ids, chunk_size):
-                data = self.get(endpoint, params={
-                    'student_ids[]': chunk,
-                    'include[]': ['assignment'],
-                    'grouped': False
-                })
-                if isinstance(data, list):
-                    all_results.extend(data)
-            return all_results
-
-        # Fallback: solo si no hay lista de estudiantes disponible.
-        return self.get(endpoint, params={
-            'student_ids[]': 'all',
-            'include[]': ['assignment'],
-            'grouped': False
-        })
+        results = []
+        size = len(clean) if group else chunk_size
+        for i in range(0, len(clean), size):
+            chunk = clean[i:i+size]
+            form = []
+            for rid in chunk:
+                form.append(('recipients[]', rid))
+            form.extend([
+                ('subject', subject or 'Seguimiento académico'),
+                ('body', body or ''),
+                ('context_code', f'course_{course_id}'),
+                ('group_conversation', 'true' if group else 'false'),
+                ('mode', 'async'),
+            ])
+            try:
+                res = self.post_json('conversations', data=form)
+                results.append({'ok': True, 'destinatarios': len(chunk), 'respuesta': res})
+            except CanvasError as e:
+                # Fallback individual, evita que un usuario inválido bloquee todo
+                if len(chunk) > 1 and not group:
+                    for rid in chunk:
+                        try:
+                            form_one = [('recipients[]', rid), ('subject', subject or 'Seguimiento académico'), ('body', body or ''), ('context_code', f'course_{course_id}'), ('group_conversation', 'false'), ('mode', 'async')]
+                            res = self.post_json('conversations', data=form_one)
+                            results.append({'ok': True, 'destinatarios': 1, 'user_id': rid, 'respuesta': res})
+                        except Exception as one_e:
+                            results.append({'ok': False, 'destinatarios': 1, 'user_id': rid, 'error': str(one_e)})
+                else:
+                    results.append({'ok': False, 'destinatarios': len(chunk), 'error': str(e)})
+        return results
